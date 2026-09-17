@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Sober launcher for FT Game Optimizer
+# Created by ft_aska.90
+# Copyright (c) 2026 ft_aska.90
+# SPDX-License-Identifier: MIT
+
+set -uo pipefail
+
+export FLATPAK_GL_DRIVERS="${FLATPAK_GL_DRIVERS:-fatix}"
+
+FATIX_GAME_BIN="${FATIX_GAME_BIN:-$HOME/.local/bin/fatix-game}"
+if [[ ! -x "$FATIX_GAME_BIN" ]]; then
+    echo "sober-fatix: fatix-game is not installed at $FATIX_GAME_BIN" >&2
+    exit 1
+fi
+
+exec "$FATIX_GAME_BIN" flatpak run org.vinegarhq.Sober "$@"
