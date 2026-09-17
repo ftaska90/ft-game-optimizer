@@ -198,7 +198,7 @@ save_and_stop_fatix() {
         FATIX_WAS_PROCESS=1
     fi
 
-    for svc in fatix.service fatix-rust.service; do
+    for svc in fatix.service fatix-rust.service fatix_rust.service; do
         if systemctl --user is-active --quiet "$svc" 2>/dev/null; then
             FATIX_ACTIVE_SERVICES+=("$svc")
             systemctl --user stop "$svc" >/dev/null 2>&1 || true
