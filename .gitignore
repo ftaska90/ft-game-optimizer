@@ -1,0 +1,13 @@
+# Local overrides / scratch files
+*.local
+*.tmp
+*.log
+
+# Editor files
+*~
+*.swp
+*.swo
+
+# Local test/build output
+build/
+out/
