@@ -14,6 +14,7 @@ mkdir -p "$BIN_DIR" "$CONFIG_DIR"
 
 install -m 0755 "$REPO_DIR/scripts/fatix-game" "$BIN_DIR/fatix-game"
 install -m 0755 "$REPO_DIR/scripts/sober-fatix" "$BIN_DIR/sober-fatix"
+install -m 0755 "$REPO_DIR/scripts/check-environment" "$BIN_DIR/fatix-game-check"
 
 if [[ ! -e "$CONFIG_DIR/config" ]]; then
     install -m 0644 "$REPO_DIR/config/fatix-game.conf" "$CONFIG_DIR/config"
@@ -27,6 +28,7 @@ echo
 echo "FT Game Optimizer installed."
 echo "Main launcher : $BIN_DIR/fatix-game"
 echo "Sober launcher: $BIN_DIR/sober-fatix"
+echo "Environment   : $BIN_DIR/fatix-game-check"
 echo "Config        : $CONFIG_DIR/config"
 echo
 echo "Recommended commands/dependencies:"
