@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+# FT Game Optimizer / Fatix Game Mode
+# Created by ft_aska.90
+# Copyright (c) 2026 ft_aska.90
+# SPDX-License-Identifier: MIT
+
+set -uo pipefail
+
+CONFIG_FILE="${FATIX_GAME_CONFIG:-$HOME/.config/fatix-game/config}"
+if [[ -r "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+fi
+
+MESA_DIR="${MESA_DIR:-$HOME/fatix-crocus/mesa}"
+BUILD_DIR="${BUILD_DIR:-$HOME/fatix-crocus/build}"
+
+FATIX_PROFILE="${FATIX_PROFILE:-balanced}"
+FATIX_SIMD_HEURISTIC="${FATIX_SIMD_HEURISTIC:-1}"
+MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-crocus}"
+vblank_mode="${vblank_mode:-0}"
+
+FATIX_GAME_POLL_INTERVAL="${FATIX_GAME_POLL_INTERVAL:-0.25}"
+FATIX_GAME_PAUSE_GUI="${FATIX_GAME_PAUSE_GUI:-1}"
+FATIX_GAME_DISABLE_COMPOSITOR="${FATIX_GAME_DISABLE_COMPOSITOR:-1}"
+FATIX_GAME_STOP_FATIX="${FATIX_GAME_STOP_FATIX:-1}"
+FATIX_GAME_STOP_LIVEW="${FATIX_GAME_STOP_LIVEW:-1}"
+FATIX_GAME_EXTRA_PROTECTED="${FATIX_GAME_EXTRA_PROTECTED:-}"
+
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}"
+STATE_DIR="$RUNTIME_BASE/fatix-game-$UID"
+LOCK_FILE="$RUNTIME_BASE/fatix-game-$UID.lock"
+
+mkdir -p "$STATE_DIR"
+exec 9>"$LOCK_FILE"
+if command -v flock >/dev/null 2>&1; then
+    if ! flock -n 9; then
+        echo "fatix-game: another game-mode instance is already active." >&2
+        exit 1
+    fi
+fi
+
+declare -a PAUSED_PIDS=()
+declare -a FATIX_ACTIVE_SERVICES=()
+
+GAME_JOB_PID=""
+LAST_FULLSCREEN_PID=""
+COMPOSITOR_PREV=""
+COMPOSITOR_TOUCHED=0
+FATIX_WAS_PROCESS=0
+LIVEW_WAS_RUNNING=0
+CLEANED_UP=0
+
+log() {
+    printf '[fatix-game] %s\n' "$*"
+}
+
+have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+is_true() {
+    case "${1,,}" in
+        1|true|yes|on) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+pid_alive() {
+    [[ "$1" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null
+}
+
+pid_running_not_zombie() {
+    local pid="$1"
+    local stat
+
+    pid_alive "$pid" || return 1
+    stat="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ -n "$stat" && "$stat" != Z* ]]
+}
+
+pid_is_ours() {
+    local pid="$1"
+    [[ "$(ps -o uid= -p "$pid" 2>/dev/null | tr -d ' ')" == "$UID" ]]
+}
+
+pid_comm() {
+    ps -o comm= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+is_protected_name() {
+    local name="$1"
+    local protected='^(Xorg|X|xfwm4|xfce4-panel|xfdesktop|xfce4-session|xfsettingsd|xfconfd|xfce4-power-manager|xfce4-notifyd|xfce4-terminal|pipewire|pipewire-pulse|wireplumber|pulseaudio|dbus-daemon|dbus-broker|systemd|systemd-udevd|NetworkManager|iwd|wpa_supplicant|polkitd|udisksd|upowerd|at-spi-bus-launcher|at-spi2-registryd|gamemoded|steam|steamwebhelper|pressure-vessel|proton|wine|wineserver|gamescope|btop|htop|kitty|alacritty|foot|konsole|ssh|sshd|bash|fish|zsh)$'
+
+    if [[ "$name" =~ $protected ]]; then
+        return 0
+    fi
+
+    if [[ -n "$FATIX_GAME_EXTRA_PROTECTED" && "$name" =~ $FATIX_GAME_EXTRA_PROTECTED ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+pid_in_game_tree() {
+    local pid="$1"
+    local parent
+    local depth=0
+
+    [[ -n "$GAME_JOB_PID" ]] || return 1
+
+    while [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && "$depth" -lt 64 ]]; do
+        [[ "$pid" == "$GAME_JOB_PID" ]] && return 0
+        parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        [[ "$parent" =~ ^[0-9]+$ ]] || break
+        [[ "$parent" == "$pid" ]] && break
+        pid="$parent"
+        ((depth+=1))
+    done
+
+    return 1
+}
+
+already_paused() {
+    local pid="$1"
+    local p
+    for p in "${PAUSED_PIDS[@]:-}"; do
+        [[ "$p" == "$pid" ]] && return 0
+    done
+    return 1
+}
+
+resume_paused() {
+    local pid
+    for pid in "${PAUSED_PIDS[@]:-}"; do
+        if pid_alive "$pid"; then
+            kill -CONT "$pid" 2>/dev/null || true
+        fi
+    done
+    PAUSED_PIDS=()
+}
+
+active_window_id() {
+    xprop -root _NET_ACTIVE_WINDOW 2>/dev/null |
+        sed -n 's/.*window id # \(0x[0-9a-fA-F]*\).*/\1/p'
+}
+
+window_pid() {
+    local wid="$1"
+    xprop -id "$wid" _NET_WM_PID 2>/dev/null |
+        sed -n 's/.* = \([0-9][0-9]*\).*/\1/p'
+}
+
+window_is_fullscreen() {
+    local wid="$1"
+    [[ -n "$wid" && "$wid" != "0x0" ]] || return 1
+    xprop -id "$wid" _NET_WM_STATE 2>/dev/null |
+        grep -q '_NET_WM_STATE_FULLSCREEN'
+}
+
+client_window_ids() {
+    xprop -root _NET_CLIENT_LIST_STACKING 2>/dev/null |
+        grep -oE '0x[0-9a-fA-F]+' || true
+}
+
+pause_nonessential_gui() {
+    local active_pid="$1"
+    local wid pid name
+
+    while read -r wid; do
+        [[ -n "$wid" ]] || continue
+        pid="$(window_pid "$wid")"
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+
+        [[ "$pid" == "$active_pid" ]] && continue
+        [[ "$pid" == "$$" || "$pid" == "$PPID" ]] && continue
+        pid_is_ours "$pid" || continue
+        pid_alive "$pid" || continue
+        pid_in_game_tree "$pid" && continue
+
+        name="$(pid_comm "$pid")"
+        [[ -n "$name" ]] || continue
+        is_protected_name "$name" && continue
+        already_paused "$pid" && continue
+
+        if kill -STOP "$pid" 2>/dev/null; then
+            PAUSED_PIDS+=("$pid")
+        fi
+    done < <(client_window_ids)
+}
+
+save_and_stop_fatix() {
+    local svc
+    is_true "$FATIX_GAME_STOP_FATIX" || return 0
+
+    if pgrep -x fatix >/dev/null 2>&1 || pgrep -x fatix_rust >/dev/null 2>&1; then
+        FATIX_WAS_PROCESS=1
+    fi
+
+    for svc in fatix.service fatix-rust.service; do
+        if systemctl --user is-active --quiet "$svc" 2>/dev/null; then
+            FATIX_ACTIVE_SERVICES+=("$svc")
+            systemctl --user stop "$svc" >/dev/null 2>&1 || true
+        fi
+    done
+
+    pkill -TERM -x fatix 2>/dev/null || true
+    pkill -TERM -x fatix_rust 2>/dev/null || true
+}
+
+restore_fatix() {
+    local svc
+    is_true "$FATIX_GAME_STOP_FATIX" || return 0
+
+    if ((${#FATIX_ACTIVE_SERVICES[@]})); then
+        for svc in "${FATIX_ACTIVE_SERVICES[@]}"; do
+            systemctl --user start "$svc" >/dev/null 2>&1 || true
+        done
+    elif ((FATIX_WAS_PROCESS)); then
+        if have_cmd fatix; then
+            nohup fatix >/dev/null 2>&1 &
+        elif [[ -x "$HOME/.local/bin/fatix" ]]; then
+            nohup "$HOME/.local/bin/fatix" >/dev/null 2>&1 &
+        fi
+    fi
+}
+
+detect_livewall_running() {
+    pgrep -af mpv 2>/dev/null |
+        grep -Eq 'xwinwrap|--wid=(0|[0-9]+)|wallpaper' &&
+        return 0
+
+    pgrep -af livew 2>/dev/null |
+        grep -vE 'grep|fatix-game' >/dev/null &&
+        return 0
+
+    return 1
+}
+
+save_and_stop_livewall() {
+    is_true "$FATIX_GAME_STOP_LIVEW" || return 0
+    have_cmd livew || return 0
+
+    if detect_livewall_running; then
+        LIVEW_WAS_RUNNING=1
+        livew --stop >/dev/null 2>&1 || true
+    fi
+}
+
+restore_livewall() {
+    is_true "$FATIX_GAME_STOP_LIVEW" || return 0
+    ((LIVEW_WAS_RUNNING)) || return 0
+    have_cmd livew || return 0
+
+    nohup livew >/dev/null 2>&1 &
+}
+
+save_and_disable_compositor() {
+    is_true "$FATIX_GAME_DISABLE_COMPOSITOR" || return 0
+    have_cmd xfconf-query || return 0
+
+    COMPOSITOR_PREV="$(xfconf-query -c xfwm4 -p /general/use_compositing 2>/dev/null || true)"
+    case "$COMPOSITOR_PREV" in
+        true)
+            xfconf-query -c xfwm4 -p /general/use_compositing -s false >/dev/null 2>&1 || true
+            COMPOSITOR_TOUCHED=1
+            ;;
+        false)
+            COMPOSITOR_TOUCHED=0
+            ;;
+    esac
+}
+
+restore_compositor() {
+    ((COMPOSITOR_TOUCHED)) || return 0
+    have_cmd xfconf-query || return 0
+    xfconf-query -c xfwm4 -p /general/use_compositing -s "$COMPOSITOR_PREV" >/dev/null 2>&1 || true
+}
+
+cleanup() {
+    ((CLEANED_UP)) && return 0
+    CLEANED_UP=1
+
+    resume_paused
+    restore_compositor
+    restore_livewall
+    restore_fatix
+
+    rm -rf "$STATE_DIR" 2>/dev/null || true
+}
+
+on_signal() {
+    local sig="$1"
+    log "received $sig; restoring desktop state."
+
+    if [[ -n "$GAME_JOB_PID" ]] && pid_alive "$GAME_JOB_PID"; then
+        kill -TERM "$GAME_JOB_PID" 2>/dev/null || true
+    fi
+
+    cleanup
+    exit 130
+}
+
+watch_fullscreen() {
+    local wid active_pid
+
+    is_true "$FATIX_GAME_PAUSE_GUI" || return 0
+    have_cmd xprop || {
+        log "xprop not found; fullscreen-aware GUI pausing disabled."
+        return 0
+    }
+
+    while [[ -n "$GAME_JOB_PID" ]] && pid_running_not_zombie "$GAME_JOB_PID"; do
+        wid="$(active_window_id)"
+
+        if window_is_fullscreen "$wid"; then
+            active_pid="$(window_pid "$wid")"
+
+            if [[ "$active_pid" != "$LAST_FULLSCREEN_PID" ]]; then
+                resume_paused
+                LAST_FULLSCREEN_PID="$active_pid"
+            fi
+
+            pause_nonessential_gui "$active_pid"
+        else
+            LAST_FULLSCREEN_PID=""
+            resume_paused
+        fi
+
+        sleep "$FATIX_GAME_POLL_INTERVAL"
+    done
+
+    resume_paused
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  fatix-game COMMAND [ARG...]
+
+Examples:
+  fatix-game glmark2
+  fatix-game ./game
+  fatix-game flatpak run org.vinegarhq.Sober
+
+The command is launched inside the custom Mesa build environment when
+~/fatix-crocus/build exists.
+EOF
+}
+
+main() {
+    local game_status=0
+
+    if (($# == 0)); then
+        usage
+        return 2
+    fi
+
+    trap 'on_signal INT' INT
+    trap 'on_signal TERM' TERM
+    trap cleanup EXIT
+
+    log "========================================"
+    log " FATIX GAME MODE"
+    log "========================================"
+    log "Mesa source : $MESA_DIR"
+    log "Mesa build  : $BUILD_DIR"
+    log "Profile     : $FATIX_PROFILE"
+    log "Fullscreen  : Alt+Tab-safe watcher @ ${FATIX_GAME_POLL_INTERVAL}s"
+
+    save_and_stop_fatix
+    save_and_stop_livewall
+    save_and_disable_compositor
+
+    export FATIX_PROFILE
+    export FATIX_SIMD_HEURISTIC
+    export MESA_LOADER_DRIVER_OVERRIDE
+    export vblank_mode
+
+    if have_cmd meson && [[ -d "$BUILD_DIR" ]]; then
+        log "Launching through custom Mesa development environment."
+        meson devenv -C "$BUILD_DIR" "$@" &
+    else
+        log "Custom Mesa build environment unavailable; launching command normally."
+        "$@" &
+    fi
+
+    GAME_JOB_PID=$!
+
+    watch_fullscreen
+    wait "$GAME_JOB_PID" || game_status=$?
+
+    cleanup
+    trap - EXIT
+    return "$game_status"
+}
+
+main "$@"
