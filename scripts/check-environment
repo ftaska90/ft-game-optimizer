@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# FT Game Optimizer environment checker
+# Created by ft_aska.90
+# Copyright (c) 2026 ft_aska.90
+# SPDX-License-Identifier: MIT
+
+set -u
+
+MESA_DIR="${MESA_DIR:-$HOME/fatix-crocus/mesa}"
+BUILD_DIR="${BUILD_DIR:-$HOME/fatix-crocus/build}"
+
+printf '%s\n' '=== FT Game Optimizer environment check ==='
+printf 'User            : %s\n' "$USER"
+printf 'Session type    : %s\n' "${XDG_SESSION_TYPE:-unknown}"
+printf 'Desktop         : %s\n' "${XDG_CURRENT_DESKTOP:-unknown}"
+printf 'Mesa source     : %s %s\n' "$MESA_DIR" "$( [[ -d "$MESA_DIR" ]] && echo '[OK]' || echo '[MISSING]' )"
+printf 'Mesa build      : %s %s\n' "$BUILD_DIR" "$( [[ -d "$BUILD_DIR" ]] && echo '[OK]' || echo '[MISSING]' )"
+
+echo
+printf '%s\n' '--- required/recommended commands ---'
+for cmd in bash xprop xfconf-query systemctl meson pgrep pkill ps flock; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        printf '%-16s %s\n' "$cmd" '[OK]'
+    else
+        printf '%-16s %s\n' "$cmd" '[MISSING]'
+    fi
+done
+
+echo
+printf '%s\n' '--- graphics ---'
+if command -v lspci >/dev/null 2>&1; then
+    lspci -nn | grep -Ei 'vga|display|3d' || true
+else
+    echo 'lspci: unavailable'
+fi
+
+if command -v glxinfo >/dev/null 2>&1; then
+    glxinfo -B 2>/dev/null | grep -E 'OpenGL vendor|OpenGL renderer|OpenGL core profile version|OpenGL version' || true
+else
+    echo 'glxinfo: unavailable'
+fi
+
+echo
+printf 'Kernel          : '
+uname -r
+
+cat <<'EOF'
+
+Reference development target:
+  Toshiba Satellite L735 (PSK0AL-010004)
+  Intel Core i3-2350M
+  Intel HD Graphics 3000 / Sandy Bridge GT2
+  PCI ID 8086:0116
+  CachyOS x86_64 / Xfce 4.20 / Xfwm4 / X11
+  Mesa 26.1.6 / Crocus / i915
+
+A mismatch does not automatically mean the project cannot work, but review
+all scripts/settings before running them on a different environment.
+EOF
