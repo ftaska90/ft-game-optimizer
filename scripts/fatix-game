@@ -194,17 +194,18 @@ save_and_stop_fatix() {
     local svc
     is_true "$FATIX_GAME_STOP_FATIX" || return 0
 
-    if pgrep -x fatix >/dev/null 2>&1 || pgrep -x fatix_rust >/dev/null 2>&1; then
+    if pgrep -x kynix >/dev/null 2>&1 || pgrep -x fatix >/dev/null 2>&1 || pgrep -x fatix_rust >/dev/null 2>&1; then
         FATIX_WAS_PROCESS=1
     fi
 
-    for svc in fatix.service fatix-rust.service fatix_rust.service; do
+    for svc in kynix.service fatix.service fatix-rust.service fatix_rust.service; do
         if systemctl --user is-active --quiet "$svc" 2>/dev/null; then
             FATIX_ACTIVE_SERVICES+=("$svc")
             systemctl --user stop "$svc" >/dev/null 2>&1 || true
         fi
     done
 
+    pkill -TERM -x kynix 2>/dev/null || true
     pkill -TERM -x fatix 2>/dev/null || true
     pkill -TERM -x fatix_rust 2>/dev/null || true
 }
@@ -218,7 +219,11 @@ restore_fatix() {
             systemctl --user start "$svc" >/dev/null 2>&1 || true
         done
     elif ((FATIX_WAS_PROCESS)); then
-        if have_cmd fatix; then
+        if have_cmd kynix; then
+            nohup kynix >/dev/null 2>&1 &
+        elif [[ -x "$HOME/.local/bin/kynix" ]]; then
+            nohup "$HOME/.local/bin/kynix" >/dev/null 2>&1 &
+        elif have_cmd fatix; then
             nohup fatix >/dev/null 2>&1 &
         elif [[ -x "$HOME/.local/bin/fatix" ]]; then
             nohup "$HOME/.local/bin/fatix" >/dev/null 2>&1 &
